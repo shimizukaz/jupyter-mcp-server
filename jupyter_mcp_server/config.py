@@ -31,7 +31,12 @@ class JupyterMCPConfig(BaseModel):
     port: int = Field(default=4040, description="The port to use for the Streamable HTTP transport")
     jupyterlab: bool = Field(default=True, description="Enable JupyterLab mode (defaults to True)")
     allowed_jupyter_mcp_tools: str = Field(default="notebook_run-all-cells,notebook_get-selected-cell", description="Comma-separated list of jupyter-mcp-tools to enable")
-    
+
+    # Instructions (included in MCP `initialize` response). Lets operators surface
+    # per-deployment guidance (coding rules, path scopes, etc.) to the LLM client.
+    instructions: Optional[str] = Field(default=None, description="MCP server instructions text included in the initialize response")
+    instructions_file: Optional[str] = Field(default=None, description="Path to a file whose contents are used as instructions. Takes precedence over 'instructions'.")
+
     class Config:
         """Pydantic configuration."""
         validate_assignment = True
@@ -54,6 +59,23 @@ class JupyterMCPConfig(BaseModel):
         if not self.allowed_jupyter_mcp_tools:
             return []
         return [tool.strip() for tool in self.allowed_jupyter_mcp_tools.split(",") if tool.strip()]
+
+    def resolve_instructions(self) -> Optional[str]:
+        """Resolve the effective instructions text.
+
+        If instructions_file is set, read and return its contents (whitespace-stripped).
+        Otherwise return the inline instructions value, or None.
+        File read errors are swallowed (caller decides logging); unreadable files
+        behave as if no instructions were set.
+        """
+        if self.instructions_file:
+            try:
+                with open(self.instructions_file, "r", encoding="utf-8") as f:
+                    text = f.read().strip()
+                return text or None
+            except OSError:
+                return None
+        return self.instructions
 
 def _get_env_bool(env_name: str, default_value: bool = True) -> bool:
     """

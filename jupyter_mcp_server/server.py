@@ -6,6 +6,7 @@
 Jupyter MCP Server Layer
 """
 
+import os
 from typing import Annotated, Literal, Optional
 from pydantic import Field
 from fastapi import Request
@@ -107,7 +108,59 @@ class FastMCPWithCORS(FastMCP):
         )
         return app
 
-mcp = FastMCPWithCORS(name="Jupyter MCP Server", json_response=False, stateless_http=True)
+def _read_instructions_from_env() -> Optional[str]:
+    """Read MCP server instructions from environment at module load time.
+
+    FastMCP takes `instructions` as a constructor argument, but the config
+    singleton may not be populated yet (CLI sets it later). So we read the
+    environment variables directly here so the instance is constructed with
+    the right value the first time. CLI flags can still override this later
+    via `set_mcp_instructions()`.
+
+    Priority: MCP_INSTRUCTIONS_FILE > MCP_INSTRUCTIONS.
+    """
+    inst_file = os.environ.get("MCP_INSTRUCTIONS_FILE")
+    if inst_file:
+        try:
+            with open(inst_file, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            if text:
+                logger.info(f"Loaded MCP instructions from file: {inst_file} ({len(text)} chars)")
+                return text
+            logger.warning(f"MCP_INSTRUCTIONS_FILE is empty after strip: {inst_file}")
+        except OSError as e:
+            logger.warning(f"Failed to read MCP_INSTRUCTIONS_FILE {inst_file}: {e}")
+
+    inst_inline = os.environ.get("MCP_INSTRUCTIONS")
+    if inst_inline:
+        logger.info(f"Loaded MCP instructions from env MCP_INSTRUCTIONS ({len(inst_inline)} chars)")
+        return inst_inline
+
+    return None
+
+
+mcp = FastMCPWithCORS(
+    name="Jupyter MCP Server",
+    instructions=_read_instructions_from_env(),
+    json_response=False,
+    stateless_http=True,
+)
+
+
+def set_mcp_instructions(text: Optional[str]) -> None:
+    """Replace the MCP server `instructions` at runtime.
+
+    FastMCP only accepts `instructions` at construction time, but the low-level
+    `_mcp_server.instructions` attribute is read dynamically by the initialize
+    handler, so mutating it works. Used by the CLI layer to apply flags that
+    arrive after the module is imported.
+    """
+    if text is None:
+        return
+    mcp._mcp_server.instructions = text
+    logger.info(f"MCP instructions updated via CLI/config ({len(text)} chars)")
+
+
 notebook_manager = NotebookManager()
 server_context = ServerContext.get_instance()
 
