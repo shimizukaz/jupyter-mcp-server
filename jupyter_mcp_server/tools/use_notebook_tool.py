@@ -5,6 +5,7 @@
 """Use notebook tool implementation."""
 
 import logging
+import os
 from typing import Any, Optional, Literal
 from pathlib import Path
 from jupyter_server_client import JupyterServerClient, NotFoundError
@@ -15,13 +16,56 @@ from jupyter_mcp_server.models import Notebook
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_KERNEL_NAME_ENV = "JUPYTER_MCP_DEFAULT_KERNEL_NAME"
+
 
 class UseNotebookTool(BaseTool):
     """Tool to use (connect to or create) a notebook file."""
     
-    async def _start_kernel_local(self, kernel_manager: Any):
-        # Start a new kernel using local API
-        kernel_id = await kernel_manager.start_kernel()
+    @staticmethod
+    def _read_kernelspec_name_http(
+        server_client: JupyterServerClient, notebook_path: str
+    ) -> Optional[str]:
+        """Read metadata.kernelspec.name from a notebook via HTTP Contents API."""
+        try:
+            contents = server_client.contents.get(
+                notebook_path, type="notebook", content=True
+            )
+            nb_content = getattr(contents, "content", None) or {}
+            return (
+                (nb_content.get("metadata") or {}).get("kernelspec") or {}
+            ).get("name")
+        except Exception as e:
+            logger.debug(f"Failed to read kernelspec from '{notebook_path}': {e}")
+            return None
+
+    @staticmethod
+    async def _read_kernelspec_name_local(
+        contents_manager: Any, notebook_path: str
+    ) -> Optional[str]:
+        """Read metadata.kernelspec.name from a notebook via local contents_manager."""
+        try:
+            model = await contents_manager.get(
+                notebook_path, content=True, type="notebook"
+            )
+            nb_content = model.get("content") or {}
+            return (
+                (nb_content.get("metadata") or {}).get("kernelspec") or {}
+            ).get("name")
+        except Exception as e:
+            logger.debug(f"Failed to read kernelspec from '{notebook_path}': {e}")
+            return None
+
+    async def _start_kernel_local(
+        self, kernel_manager: Any, kernel_name: Optional[str] = None
+    ):
+        # Start a new kernel using local API. Passing kernel_name lets the
+        # server honor the notebook's kernelspec; None falls back to
+        # MultiKernelManager.default_kernel_name.
+        start_kwargs = {}
+        if kernel_name:
+            start_kwargs["kernel_name"] = kernel_name
+        kernel_id = await kernel_manager.start_kernel(**start_kwargs)
         logger.info(f"Started kernel '{kernel_id}', waiting for it to be ready...")
         
         # CRITICAL: Wait for the kernel to actually start and be ready
@@ -188,6 +232,25 @@ class UseNotebookTool(BaseTool):
                     return f"The path '{notebook_path}' is not the correct path for notebook '{notebook_name}'. Do you mean connect to '{notebook_manager.get_notebook_path(notebook_name)}'?"
         # add new notebook to notebook_manager
         else:
+            # Resolve kernelspec name from the notebook metadata so that the
+            # kernel we start matches what the .ipynb declares. Falls back to
+            # the JUPYTER_MCP_DEFAULT_KERNEL_NAME env var (typically set for
+            # freshly-created notebooks that have no metadata yet), and
+            # finally to None — which lets the server-side default kick in.
+            kernel_spec_name: Optional[str] = None
+            if kernel_id is None:
+                if use_mode == "connect":
+                    if mode == ServerMode.MCP_SERVER and server_client is not None:
+                        kernel_spec_name = self._read_kernelspec_name_http(
+                            server_client, notebook_path
+                        )
+                    elif mode == ServerMode.JUPYTER_SERVER and contents_manager is not None:
+                        kernel_spec_name = await self._read_kernelspec_name_local(
+                            contents_manager, notebook_path
+                        )
+                if not kernel_spec_name:
+                    kernel_spec_name = os.environ.get(_DEFAULT_KERNEL_NAME_ENV) or None
+
             # # Create/connect to kernel based on mode
             if mode == ServerMode.MCP_SERVER and server_client is not None:
                 if kernel_id is not None:
@@ -200,8 +263,12 @@ class UseNotebookTool(BaseTool):
                     token=runtime_token,
                     kernel_id=kernel_id
                 )
-                # FIXED: Ensure kernel is started with the same path as the notebook
-                kernel.start(path=notebook_path)
+                # Pass the resolved kernelspec name so KernelClient.start()
+                # does not fall back to its hard-coded "python3" default.
+                start_kwargs = {"path": notebook_path}
+                if kernel_spec_name:
+                    start_kwargs["name"] = kernel_spec_name
+                kernel.start(**start_kwargs)
 
                 info_list.append(f"[INFO] Connected to kernel '{kernel.id}'.")
             elif mode == ServerMode.JUPYTER_SERVER and kernel_manager is not None:
@@ -212,7 +279,9 @@ class UseNotebookTool(BaseTool):
                         return f"Kernel '{kernel_id}' not found in local kernel manager."
                     kernel = {"id": kernel_id}
                 else:
-                    kernel = await self._start_kernel_local(kernel_manager)
+                    kernel = await self._start_kernel_local(
+                        kernel_manager, kernel_name=kernel_spec_name
+                    )
                     kernel_id = kernel['id']
 
                 info_list.append(f"[INFO] Connected to kernel '{kernel_id}'.")
