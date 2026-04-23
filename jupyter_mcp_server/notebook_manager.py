@@ -18,6 +18,52 @@ from jupyter_kernel_client import KernelClient
 from .config import get_config
 
 
+# Internal sentinel key used when no MCP request/session context is active
+# (e.g., server lifespan hooks, CLI one-shots, stdio transport without a
+# request being dispatched). All callers outside a request share this slot.
+_NO_SESSION_KEY = "_no_session_"
+
+
+def _current_session_key() -> str:
+    """Return a key identifying the MCP session that is handling the current
+    request, or `_NO_SESSION_KEY` if we are not inside a request dispatch.
+
+    For the StreamableHTTP transport we prefer the `mcp-session-id` header so
+    that reconnecting clients with the same session id keep their state.
+    For stdio (and if the header is absent) we fall back to the `id()` of the
+    ServerSession object, which is stable for the lifetime of that session.
+
+    The lookup is tolerant of layout changes in the MCP SDK — any unexpected
+    shape simply degrades to `_NO_SESSION_KEY` so session-less call sites
+    (tests, CLI) keep working.
+    """
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+    except ImportError:
+        return _NO_SESSION_KEY
+
+    try:
+        ctx = request_ctx.get()
+    except LookupError:
+        return _NO_SESSION_KEY
+
+    # Prefer the true MCP session id from the HTTP header when available.
+    try:
+        req = getattr(ctx, "request", None)
+        if req is not None:
+            sid = req.headers.get("mcp-session-id")
+            if sid:
+                return f"mcp-session:{sid}"
+    except AttributeError:
+        pass
+
+    session = getattr(ctx, "session", None)
+    if session is not None:
+        return f"server-session:{id(session)}"
+
+    return _NO_SESSION_KEY
+
+
 class NotebookConnection:
     """
     Context manager for Notebook connections that handles the lifecycle
@@ -73,8 +119,38 @@ class NotebookManager:
     def __init__(self):
         self._notebooks: Dict[str, Dict[str, Any]] = {}
         self._default_notebook_name = "default"
-        self._current_notebook: Optional[str] = None  # Currently active notebook
-    
+        # `_current_notebook` is exposed as a property (see below). Under the
+        # hood we keep the "currently active notebook" per MCP session so that
+        # two clients talking to the same server process (e.g. Claude Desktop
+        # and Claude Code connected simultaneously, or two tabs in the same
+        # browser) cannot overwrite each other's active selection. Fixes
+        # datalayer/jupyter-mcp-server#181 for the `_current_notebook` hot
+        # spot. The `_notebooks` registry itself is still shared because
+        # notebooks are named globally on the target Jupyter server.
+        self._current_by_session: Dict[str, str] = {}
+        self._current_fallback: Optional[str] = None
+
+    @property
+    def _current_notebook(self) -> Optional[str]:
+        key = _current_session_key()
+        if key != _NO_SESSION_KEY and key in self._current_by_session:
+            return self._current_by_session[key]
+        return self._current_fallback
+
+    @_current_notebook.setter
+    def _current_notebook(self, value: Optional[str]) -> None:
+        key = _current_session_key()
+        if key == _NO_SESSION_KEY:
+            # No request context — update the shared fallback slot so
+            # call sites outside a request (CLI, tests, lifespan hooks)
+            # keep the legacy single-value behaviour.
+            self._current_fallback = value
+            return
+        if value is None:
+            self._current_by_session.pop(key, None)
+        else:
+            self._current_by_session[key] = value
+
     def __contains__(self, name: str) -> bool:
         """Check if a notebook is managed by this instance."""
         return name in self._notebooks
@@ -146,18 +222,26 @@ class NotebookManager:
                 pass
             finally:
                 del self._notebooks[name]
-                
-                # If we removed the current notebook, update the current pointer
-                if self._current_notebook == name:
-                    # Set to another notebook if available, prefer "default" for compatibility
-                    if self._default_notebook_name in self._notebooks:
-                        self._current_notebook = self._default_notebook_name
-                    elif self._notebooks:
-                        # Set to the first available notebook
-                        self._current_notebook = next(iter(self._notebooks.keys()))
-                    else:
-                        # No notebooks left
-                        self._current_notebook = None
+
+                # Re-point every session (and the fallback) that was using the
+                # removed notebook, since the registry is shared across sessions
+                # even though the active-pointer is per-session.
+                if self._default_notebook_name in self._notebooks:
+                    replacement: Optional[str] = self._default_notebook_name
+                elif self._notebooks:
+                    replacement = next(iter(self._notebooks.keys()))
+                else:
+                    replacement = None
+
+                for sid, current in list(self._current_by_session.items()):
+                    if current == name:
+                        if replacement is None:
+                            self._current_by_session.pop(sid, None)
+                        else:
+                            self._current_by_session[sid] = replacement
+
+                if self._current_fallback == name:
+                    self._current_fallback = replacement
             return True
         return False
     
