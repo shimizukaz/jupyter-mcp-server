@@ -147,6 +147,43 @@ mcp = FastMCPWithCORS(
 )
 
 
+_INSTRUCTIONS_DESC_MARKER = "[--- end of server policy ---]"
+
+
+def _apply_instructions_to_tool_descriptions(text: Optional[str]) -> None:
+    """Prepend the server `instructions` to every registered tool's description.
+
+    Some MCP clients (notably Claude Desktop as of early 2026) do not surface
+    the `initialize` response's `instructions` field to the LLM. Tool
+    `description` fields, however, are read by every client for tool
+    selection, so prepending the instructions there makes them reach the
+    model regardless of the client's `instructions` handling.
+
+    Idempotent: descriptions already containing the marker are skipped so
+    repeated calls do not stack prefixes.
+    """
+    if not text:
+        return
+    prefix = (
+        "[--- begin server policy (applies to every operation) ---]\n"
+        f"{text}\n"
+        f"{_INSTRUCTIONS_DESC_MARKER}\n\n"
+    )
+    tool_manager = mcp._tool_manager
+    updated = 0
+    for tool in tool_manager._tools.values():
+        current = tool.description or ""
+        if _INSTRUCTIONS_DESC_MARKER in current:
+            continue
+        tool.description = prefix + current
+        updated += 1
+    if updated:
+        logger.info(
+            f"Prepended server instructions to {updated} tool description(s) "
+            f"for clients that do not read the initialize.instructions field"
+        )
+
+
 def set_mcp_instructions(text: Optional[str]) -> None:
     """Replace the MCP server `instructions` at runtime.
 
@@ -154,11 +191,15 @@ def set_mcp_instructions(text: Optional[str]) -> None:
     `_mcp_server.instructions` attribute is read dynamically by the initialize
     handler, so mutating it works. Used by the CLI layer to apply flags that
     arrive after the module is imported.
+
+    Also prepends the instructions to every tool description for compatibility
+    with MCP clients that ignore `initialize.instructions`.
     """
     if text is None:
         return
     mcp._mcp_server.instructions = text
     logger.info(f"MCP instructions updated via CLI/config ({len(text)} chars)")
+    _apply_instructions_to_tool_descriptions(text)
 
 
 notebook_manager = NotebookManager()
@@ -1043,5 +1084,12 @@ async def get_registered_tools():
             tool_dict["outputSchema"] = []
         
         tools.append(tool_dict)
-    
+
     return tools
+
+
+# If env-loaded instructions are present, prepend them to every tool description
+# now that all @mcp.tool registrations have completed. Idempotent — CLI calling
+# set_mcp_instructions later is a no-op for descriptions when the marker is
+# already present. Runs at module load time.
+_apply_instructions_to_tool_descriptions(mcp._mcp_server.instructions)
