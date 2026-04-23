@@ -18,6 +18,7 @@ from jupyter_mcp_server.server_context import ServerContext
 # Import the server instance and helper functions from server layer
 from jupyter_mcp_server.server import (
     mcp,
+    set_mcp_instructions,
     __start_kernel,
     __auto_enroll_document,
 )
@@ -116,7 +117,21 @@ def _common_options(f):
             type=click.STRING,
             default="notebook_run-all-cells,notebook_get-selected-cell",
             help="Comma-separated list of jupyter-mcp-tools to enable. Defaults to 'notebook_run-all-cells,notebook_get-selected-cell' - Only applicable when run as jupyter server extension.",
-        )
+        ),
+        click.option(
+            "--mcp-instructions",
+            envvar="MCP_INSTRUCTIONS",
+            type=click.STRING,
+            default=None,
+            help="Inline text to use as MCP server instructions (returned in the initialize response).",
+        ),
+        click.option(
+            "--mcp-instructions-file",
+            envvar="MCP_INSTRUCTIONS_FILE",
+            type=click.Path(exists=False, dir_okay=False),
+            default=None,
+            help="Path to a file whose contents are used as MCP server instructions. Takes precedence over --mcp-instructions.",
+        ),
     ]
     # Apply decorators in reverse order
     for option in reversed(options):
@@ -189,6 +204,8 @@ def _do_start(
     otel_file: str = "",
     mcp_token: str = None,
     insecure_mcp_noauth: bool = False,
+    mcp_instructions: str = None,
+    mcp_instructions_file: str = None,
 ):
     """Internal function to execute the start logic."""
 
@@ -222,8 +239,17 @@ def _do_start(
         document_token=document_token,
         port=port,
         jupyterlab=jupyterlab,
-        allowed_jupyter_mcp_tools=allowed_jupyter_mcp_tools
+        allowed_jupyter_mcp_tools=allowed_jupyter_mcp_tools,
+        instructions=mcp_instructions,
+        instructions_file=mcp_instructions_file,
     )
+
+    # Apply instructions onto the live FastMCP instance. server.py already read
+    # env vars at module load; if a CLI flag was passed (but env wasn't set
+    # before the import), this ensures the instructions still get injected.
+    resolved_instructions = config.resolve_instructions()
+    if resolved_instructions:
+        set_mcp_instructions(resolved_instructions)
 
     # Reset ServerContext to pick up new configuration
     ServerContext.reset()
@@ -347,6 +373,8 @@ def server(
     jupyterlab: bool,
     allowed_jupyter_mcp_tools: str,
     otel_file: str,
+    mcp_instructions: str,
+    mcp_instructions_file: str,
 ):
     """Manages Jupyter MCP Server.
 
@@ -386,6 +414,8 @@ def server(
         otel_file=otel_file,
         mcp_token=mcp_token,
         insecure_mcp_noauth=insecure_mcp_noauth,
+        mcp_instructions=mcp_instructions,
+        mcp_instructions_file=mcp_instructions_file,
     )
 
 
@@ -413,6 +443,8 @@ def connect_command(
     jupyter_url: str,
     jupyter_token: str,
     allowed_jupyter_mcp_tools: str,
+    mcp_instructions: str,
+    mcp_instructions_file: str,
 ):
     """Command to connect a Jupyter MCP Server to a document and a runtime."""
 
@@ -530,6 +562,8 @@ def start_command(
     jupyterlab: bool,
     allowed_jupyter_mcp_tools: str,
     otel_file: str,
+    mcp_instructions: str,
+    mcp_instructions_file: str,
 ):
     """Start the Jupyter MCP server with a transport."""
     # Resolve URL and token variables based on priority logic
@@ -558,6 +592,8 @@ def start_command(
         otel_file=otel_file,
         mcp_token=mcp_token,
         insecure_mcp_noauth=insecure_mcp_noauth,
+        mcp_instructions=mcp_instructions,
+        mcp_instructions_file=mcp_instructions_file,
     )
 
 
